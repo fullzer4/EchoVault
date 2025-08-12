@@ -130,3 +130,71 @@ pub fn validate_dpop(
 
     Ok(())
 }
+
+pub fn validate_dpop_and_get_jkt(
+    method: &str,
+    host: Option<&str>,
+    path_and_query: &str,
+    dpop_header: &str,
+    public_origin: Option<&str>,
+    replay: &ReplayCache,
+    now_ts: i64,
+) -> Result<String, &'static str> {
+    // Split compact JWS
+    let parts: Vec<&str> = dpop_header.split('.').collect();
+    if parts.len() != 3 { return Err("bad_dpop"); }
+    let header_b64 = parts[0];
+    let payload_b64 = parts[1];
+    let sig_b64 = parts[2];
+    let header_raw = b64u_decode(header_b64)?;
+    let payload_raw = b64u_decode(payload_b64)?;
+
+    let header: DPoPHeader = serde_json::from_slice(&header_raw).map_err(|_| "bad_dpop")?;
+    if header.typ.as_deref() != Some("dpop+jwt") { return Err("bad_dpop_typ"); }
+    if header.alg != "ES256" && header.alg != "EdDSA" { return Err("bad_dpop_alg"); }
+
+    let payload: DPoPPayload = serde_json::from_slice(&payload_raw).map_err(|_| "bad_dpop")?;
+
+    // htm
+    if payload.htm.to_uppercase() != method.to_uppercase() { return Err("bad_htm"); }
+
+    // htu
+    let origin = if let Some(orig) = public_origin { orig.to_string() } else {
+        let host = host.ok_or("no_host")?;
+        format!("http://{}", host)
+    };
+    let expected_htu = build_htu(&origin, path_and_query);
+    if payload.htu != expected_htu { return Err("bad_htu"); }
+
+    // iat window 5 min
+    if (now_ts - payload.iat).abs() > 300 { return Err("iat_window"); }
+
+    // jti anti-replay
+    if !replay.check_and_store(&payload.jti, now_ts) { return Err("replay"); }
+
+    // compute jkt from header.jwk
+    let jkt = compute_ec_thumbprint_b64u(&header.jwk)?;
+
+    // signature verification
+    let sig = b64u_decode(sig_b64)?;
+    let signing_input = [header_b64.as_bytes(), b".", payload_b64.as_bytes()].concat();
+
+    let jwk_json = header.jwk.to_string();
+    let jwk = Jwk::from_bytes(jwk_json.as_bytes()).map_err(|_| "bad_jwk")?;
+    let verified = match header.alg.as_str() {
+        "ES256" => EcdsaJwsAlgorithm::Es256
+            .verifier_from_jwk(&jwk)
+            .ok()
+            .and_then(|v| v.verify(&signing_input, &sig).ok())
+            .is_some(),
+        "EdDSA" => EddsaJwsAlgorithm::Eddsa
+            .verifier_from_jwk(&jwk)
+            .ok()
+            .and_then(|v| v.verify(&signing_input, &sig).ok())
+            .is_some(),
+        _ => false,
+    };
+    if !verified { return Err("bad_sig"); }
+
+    Ok(jkt)
+}
