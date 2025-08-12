@@ -1,0 +1,9 @@
+DROP TABLE IF EXISTS credentials;
+DROP TABLE IF EXISTS webauthn_reg;
+DROP INDEX IF EXISTS idx_refresh_device;
+DROP INDEX IF EXISTS idx_refresh_user;
+DROP TABLE IF EXISTS refresh_tokens;
+DROP INDEX IF EXISTS idx_devices_jkt;
+DROP INDEX IF EXISTS idx_devices_user;
+DROP TABLE IF EXISTS devices;
+DROP TABLE IF EXISTS users;

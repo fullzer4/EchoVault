@@ -1,23 +1,25 @@
-use axum::{extract::{State, FromRef, Request}, http::{HeaderMap, StatusCode, header}, response::IntoResponse, routing::{post, get}, Json, Router};
+use axum::{extract::{State, FromRef, OriginalUri}, http::{HeaderMap, StatusCode, header, Method}, response::IntoResponse, routing::{post, get}, Json, Router};
 use serde::{Deserialize, Serialize};
 use time::OffsetDateTime;
 use uuid::Uuid;
 use base64::Engine; // for .encode on URL_SAFE_NO_PAD
 use rand::RngCore;
 use argon2::{Argon2, password_hash::{PasswordHasher, PasswordVerifier, SaltString}};
+use std::sync::Arc;
+use webauthn_rs::prelude::*;
 
 use crate::{config::Config, db::Db, auth::tokens};
 use crate::auth::dpop::{validate_dpop, ReplayCache};
-use http::Request as HttpRequest;
 
-#[derive(Clone)]
-struct Security { replay: ReplayCache }
+#[derive(Clone, Debug)]
+pub struct Security { pub replay: ReplayCache }
 
 #[derive(Clone)]
 pub struct AppState {
     pub db: Db,
     pub cfg: Config,
     pub sec: Security,
+    pub webauthn: Arc<Webauthn>,
 }
 
 impl FromRef<AppState> for Db { fn from_ref(s: &AppState) -> Db { s.db.clone() } }
@@ -25,13 +27,11 @@ impl FromRef<AppState> for Config { fn from_ref(s: &AppState) -> Config { s.cfg.
 impl FromRef<AppState> for Security { fn from_ref(s: &AppState) -> Security { s.sec.clone() } }
 
 #[derive(Debug, Deserialize)]
-struct BeginRegisterReq { username: String }
+struct BeginRegisterReq { username: String, display_name: Option<String> }
 #[derive(Debug, Serialize)]
-struct BeginRegisterResp { challenge: String }
+struct BeginRegisterResp { challenge: CreationChallengeResponse, reg_id: String }
 
 async fn begin_register(State(state): State<AppState>, Json(req): Json<BeginRegisterReq>) -> impl IntoResponse {
-    let challenge = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(Uuid::new_v4().as_bytes());
-
     let exists = sqlx::query_scalar::<_, i64>("SELECT COUNT(1) FROM users WHERE username = ?")
         .bind(&req.username)
         .fetch_one(&state.db)
@@ -39,24 +39,68 @@ async fn begin_register(State(state): State<AppState>, Json(req): Json<BeginRegi
         .unwrap_or(0);
     if exists > 0 { return (StatusCode::CONFLICT, "username_taken").into_response(); }
 
-    (StatusCode::OK, Json(BeginRegisterResp{ challenge })).into_response()
+    // Generate a stable user id for this registration flow
+    let user_id = Uuid::new_v4();
+    let display = req.display_name.clone().unwrap_or_else(|| req.username.clone());
+
+    let (challenge, reg_state) = match state.webauthn.start_passkey_registration(
+        user_id,
+        &req.username,
+        &display,
+        None,
+    ) {
+        Ok(v) => v,
+        Err(_) => return (StatusCode::INTERNAL_SERVER_ERROR, "webauthn_error").into_response(),
+    };
+
+    let reg_id = Uuid::new_v4().to_string();
+    let state_json = match serde_json::to_string(&reg_state) { Ok(s) => s, Err(_) => return (StatusCode::INTERNAL_SERVER_ERROR, "state_error").into_response() };
+    let now = OffsetDateTime::now_utc().unix_timestamp();
+    let _ = sqlx::query("INSERT INTO webauthn_reg (id, username, user_id, state_json, created_at) VALUES (?, ?, ?, ?, ?)")
+        .bind(&reg_id).bind(&req.username).bind(user_id.to_string()).bind(state_json).bind(now)
+        .execute(&state.db).await;
+
+    (StatusCode::OK, Json(BeginRegisterResp{ challenge, reg_id })).into_response()
 }
 
 #[derive(Debug, Deserialize)]
-struct FinishRegisterReq { username: String }
+struct FinishRegisterReq { reg_id: String, credential: RegisterPublicKeyCredential }
 
 async fn finish_register(State(state): State<AppState>, Json(req): Json<FinishRegisterReq>) -> impl IntoResponse {
-    let id = Uuid::new_v4().to_string();
+    // Load pending state
+    let row = sqlx::query_as::<_, (String, String, String)>("SELECT username, user_id, state_json FROM webauthn_reg WHERE id = ?")
+        .bind(&req.reg_id)
+        .fetch_optional(&state.db).await;
+
+    let Some((username, user_id, state_json)) = (match row { Ok(v) => v, Err(_) => None }) else {
+        return (StatusCode::BAD_REQUEST, "invalid_reg").into_response();
+    };
+
+    let reg_state: PasskeyRegistration = match serde_json::from_str(&state_json) { Ok(s) => s, Err(_) => return (StatusCode::BAD_REQUEST, "bad_state").into_response() };
+
+    // Complete registration
+    let passkey: Passkey = match state.webauthn.finish_passkey_registration(&req.credential, &reg_state) {
+        Ok(pk) => pk,
+        Err(_) => return (StatusCode::BAD_REQUEST, "webauthn_verify_failed").into_response(),
+    };
+
+    // Create user record (id from begin step)
     let now = OffsetDateTime::now_utc().unix_timestamp();
-    let res = sqlx::query("INSERT INTO users (id, username, created_at) VALUES (?, ?, ?)")
-        .bind(&id).bind(&req.username).bind(now)
+    let _ = sqlx::query("INSERT OR IGNORE INTO users (id, username, created_at) VALUES (?, ?, ?)")
+        .bind(&user_id).bind(&username).bind(now)
         .execute(&state.db).await;
 
-    match res {
-        Ok(_) => (StatusCode::CREATED, "registered").into_response(),
-        Err(e) if e.as_database_error().map(|d| d.message().contains("UNIQUE")).unwrap_or(false) => (StatusCode::CONFLICT, "username_taken").into_response(),
-        Err(_) => (StatusCode::INTERNAL_SERVER_ERROR, "error").into_response(),
-    }
+    // Store credential
+    let passkey_json = match serde_json::to_string(&passkey) { Ok(s) => s, Err(_) => return (StatusCode::INTERNAL_SERVER_ERROR, "persist_error").into_response() };
+    let cred_row_id = Uuid::new_v4().to_string();
+    let _ = sqlx::query("INSERT INTO credentials (id, user_id, passkey_json, created_at) VALUES (?, ?, ?, ?)")
+        .bind(&cred_row_id).bind(&user_id).bind(passkey_json).bind(now)
+        .execute(&state.db).await;
+
+    // Cleanup
+    let _ = sqlx::query("DELETE FROM webauthn_reg WHERE id = ?").bind(&req.reg_id).execute(&state.db).await;
+
+    (StatusCode::CREATED, "registered").into_response()
 }
 
 #[derive(Debug, Deserialize)]
@@ -80,7 +124,7 @@ async fn login(State(state): State<AppState>, Json(req): Json<LoginReq>) -> impl
         .execute(&state.db).await;
 
     // access token
-    let (access_token, exp) = match tokens::issue_access(&user_id, req.jkt.clone(), &state.cfg.jwt_secret, 15) {
+    let (access_token, exp) = match tokens::issue_access(&user_id, req.jkt.clone(), &state.cfg.jwt_secret, (state.cfg.jwt_ttl_secs/60).max(1) as i64) {
         Ok(x) => x,
         Err(_) => return (StatusCode::INTERNAL_SERVER_ERROR, "token_error").into_response(),
     };
@@ -93,7 +137,7 @@ async fn login(State(state): State<AppState>, Json(req): Json<LoginReq>) -> impl
     let hash = Argon2::default().hash_password(refresh.as_bytes(), &salt).map(|p| p.to_string()).unwrap_or_default();
 
     let _ = sqlx::query("INSERT INTO refresh_tokens (token_hash, user_id, device_id, expires_at, created_at, revoked) VALUES (?, ?, ?, ?, ?, 0)")
-        .bind(&hash).bind(&user_id).bind(&device_id).bind(now + 60*60*24*30).bind(now)
+        .bind(&hash).bind(&user_id).bind(&device_id).bind(now + state.cfg.refresh_ttl_secs).bind(now)
         .execute(&state.db).await;
 
     (StatusCode::OK, Json(LoginResp { access_token, expires_at: exp, refresh_token: refresh })).into_response()
@@ -104,7 +148,7 @@ struct RefreshReq { refresh_token: String, jkt: Option<String> }
 #[derive(Debug, Serialize)]
 struct RefreshResp { access_token: String, expires_at: i64, refresh_token: String }
 
-async fn refresh(State(state): State<AppState>, Json(req): Json<RefreshReq>) -> impl IntoResponse {
+async fn refresh(State(state): State<AppState>, headers: HeaderMap, method: Method, original_uri: OriginalUri, Json(req_body): Json<RefreshReq>) -> impl IntoResponse {
     // Find matching hash (runtime query to avoid sqlx compile-time DB access)
     let rows = sqlx::query_as::<_, (String, String, String, i64, i64)>(
         "SELECT token_hash, user_id, device_id, expires_at, revoked FROM refresh_tokens"
@@ -118,7 +162,7 @@ async fn refresh(State(state): State<AppState>, Json(req): Json<RefreshReq>) -> 
         if revoked != 0 { continue; }
         if expires_at < OffsetDateTime::now_utc().unix_timestamp() { continue; }
         let parsed = match argon2::PasswordHash::new(&token_hash) { Ok(p) => p, Err(_) => continue };
-        if Argon2::default().verify_password(req.refresh_token.as_bytes(), &parsed).is_ok() {
+        if Argon2::default().verify_password(req_body.refresh_token.as_bytes(), &parsed).is_ok() {
             matched = Some((user_id, device_id));
             break;
         }
@@ -126,12 +170,29 @@ async fn refresh(State(state): State<AppState>, Json(req): Json<RefreshReq>) -> 
 
     let Some((user_id, device_id)) = matched else { return (StatusCode::UNAUTHORIZED, "invalid_refresh").into_response() };
 
+    // If device has jkt, enforce DPoP
+    let device_jkt = sqlx::query_scalar::<_, Option<String>>("SELECT jkt FROM devices WHERE id = ?")
+        .bind(&device_id)
+        .fetch_one(&state.db).await.ok().flatten();
+    if let Some(required_jkt) = device_jkt {
+        let dpop = headers.get("DPoP").and_then(|v| v.to_str().ok());
+        if dpop.is_none() { return (StatusCode::UNAUTHORIZED, "missing_dpop").into_response(); }
+        let method = method.as_str();
+        let path_q = original_uri.0.path_and_query().map(|pq| pq.as_str()).unwrap_or(original_uri.0.path());
+        let host = headers.get(header::HOST).and_then(|v| v.to_str().ok());
+        let now = OffsetDateTime::now_utc().unix_timestamp();
+        let origin = state.cfg.public_origin.as_deref();
+        if validate_dpop(method, host, path_q, dpop.unwrap(), &required_jkt, origin, &state.sec.replay, now).is_err() {
+            return (StatusCode::UNAUTHORIZED, "invalid_dpop").into_response();
+        }
+    }
+
     // rotate: revoke all matching hashes for this device (reuse detection simplified)
     let _ = sqlx::query("UPDATE refresh_tokens SET revoked = 1, last_used_at = ? WHERE device_id = ? AND revoked = 0")
         .bind(OffsetDateTime::now_utc().unix_timestamp()).bind(&device_id).execute(&state.db).await;
 
     // issue new access
-    let (access_token, exp) = match tokens::issue_access(&user_id, req.jkt.clone(), &state.cfg.jwt_secret, 15) {
+    let (access_token, exp) = match tokens::issue_access(&user_id, req_body.jkt.clone(), &state.cfg.jwt_secret, (state.cfg.jwt_ttl_secs/60).max(1) as i64) {
         Ok(x) => x,
         Err(_) => return (StatusCode::INTERNAL_SERVER_ERROR, "token_error").into_response(),
     };
@@ -144,7 +205,7 @@ async fn refresh(State(state): State<AppState>, Json(req): Json<RefreshReq>) -> 
 
     let now = OffsetDateTime::now_utc().unix_timestamp();
     let _ = sqlx::query("INSERT INTO refresh_tokens (token_hash, user_id, device_id, expires_at, created_at, revoked) VALUES (?, ?, ?, ?, ?, 0)")
-        .bind(&hash).bind(&user_id).bind(&device_id).bind(now + 60*60*24*30).bind(now)
+        .bind(&hash).bind(&user_id).bind(&device_id).bind(now + state.cfg.refresh_ttl_secs).bind(now)
         .execute(&state.db).await;
 
     (StatusCode::OK, Json(RefreshResp { access_token, expires_at: exp, refresh_token: refresh })).into_response()
@@ -153,7 +214,7 @@ async fn refresh(State(state): State<AppState>, Json(req): Json<RefreshReq>) -> 
 // Extractor that validates Bearer and DPoP
 struct AuthCtx { pub sub: String }
 
-async fn require_dpop(State(state): State<AppState>, headers: HeaderMap, req: Request) -> Result<AuthCtx, (StatusCode, &'static str)> {
+async fn require_dpop(State(state): State<AppState>, headers: HeaderMap, method: Method, original_uri: OriginalUri) -> Result<AuthCtx, (StatusCode, &'static str)> {
     // Authorization
     let auth = headers.get(header::AUTHORIZATION).and_then(|v| v.to_str().ok()).ok_or((StatusCode::UNAUTHORIZED, "missing_auth"))?;
     if !auth.starts_with("Bearer ") { return Err((StatusCode::UNAUTHORIZED, "invalid_auth")); }
@@ -168,26 +229,33 @@ async fn require_dpop(State(state): State<AppState>, headers: HeaderMap, req: Re
     let dpop = headers.get("DPoP").and_then(|v| v.to_str().ok()).ok_or((StatusCode::UNAUTHORIZED, "missing_dpop"))?;
 
     // Build request context
-    let method = req.method().as_str();
-    let path_q = req.uri().path_and_query().map(|pq| pq.as_str()).unwrap_or(req.uri().path());
+    let method = method.as_str();
+    let path_q = original_uri.0.path_and_query().map(|pq| pq.as_str()).unwrap_or(original_uri.0.path());
     let host = headers.get(header::HOST).and_then(|v| v.to_str().ok());
 
     let now = OffsetDateTime::now_utc().unix_timestamp();
-    validate_dpop(method, host, path_q, dpop, &jkt, None, &state.sec.replay, now)
+    let origin = state.cfg.public_origin.as_deref();
+    validate_dpop(method, host, path_q, dpop, &jkt, origin, &state.sec.replay, now)
         .map_err(|_| (StatusCode::UNAUTHORIZED, "invalid_dpop"))?;
-
     Ok(AuthCtx { sub })
 }
 
-async fn me(State(_state): State<AppState>, headers: HeaderMap, req: Request) -> impl IntoResponse {
-    match require_dpop(State(_state.clone()), headers, req).await {
+async fn me(State(state): State<AppState>, headers: HeaderMap, method: Method, original_uri: OriginalUri) -> impl IntoResponse {
+    match require_dpop(State(state.clone()), headers, method, original_uri).await {
         Ok(ctx) => (StatusCode::OK, Json(serde_json::json!({"sub": ctx.sub }))).into_response(),
         Err(e) => e.into_response(),
     }
 }
 
 pub fn router(db: Db, cfg: Config) -> Router {
-    let state = AppState { db, cfg, sec: Security { replay: ReplayCache::new(300) } };
+    let origin = cfg.public_origin.clone().expect("EV_PUBLIC_ORIGIN must be set for WebAuthn");
+    let url = Url::parse(&origin).expect("valid EV_PUBLIC_ORIGIN");
+    let rp_id = cfg.rp_id.clone().unwrap_or_else(|| url.domain().map(|s| s.to_string()).or_else(|| url.host_str().map(|s| s.to_string())).unwrap_or_else(|| "localhost".to_string()));
+
+    let builder = WebauthnBuilder::new(&rp_id, &url).expect("valid WebAuthn config");
+    let webauthn = builder.build().expect("valid WebAuthn build");
+
+    let state = AppState { db, cfg, sec: Security { replay: ReplayCache::new(300) }, webauthn: Arc::new(webauthn) };
     Router::new()
         .route("/auth/register", post(begin_register))
         .route("/auth/register/finish", post(finish_register))

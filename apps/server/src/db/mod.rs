@@ -30,44 +30,7 @@ pub async fn init_pool(url: &str) -> anyhow::Result<Db> {
 }
 
 pub async fn run_migrations(pool: &Db) -> anyhow::Result<()> {
-    // Minimal schema for auth with indices and audit fields
-    sqlx::query(
-        r#"
-        CREATE TABLE IF NOT EXISTS users (
-            id TEXT PRIMARY KEY NOT NULL,
-            username TEXT UNIQUE NOT NULL,
-            created_at INTEGER NOT NULL
-        );
-
-        CREATE TABLE IF NOT EXISTS devices (
-            id TEXT PRIMARY KEY NOT NULL,
-            user_id TEXT NOT NULL,
-            name TEXT NOT NULL,
-            jkt TEXT,
-            ua TEXT,
-            ip TEXT,
-            last_seen INTEGER,
-            created_at INTEGER NOT NULL,
-            FOREIGN KEY(user_id) REFERENCES users(id)
-        );
-        CREATE INDEX IF NOT EXISTS idx_devices_user ON devices(user_id);
-        CREATE INDEX IF NOT EXISTS idx_devices_jkt ON devices(jkt);
-
-        CREATE TABLE IF NOT EXISTS refresh_tokens (
-            token_hash TEXT PRIMARY KEY NOT NULL,
-            user_id TEXT NOT NULL,
-            device_id TEXT NOT NULL,
-            expires_at INTEGER NOT NULL,
-            created_at INTEGER NOT NULL,
-            revoked INTEGER NOT NULL DEFAULT 0,
-            last_used_at INTEGER,
-            FOREIGN KEY(user_id) REFERENCES users(id),
-            FOREIGN KEY(device_id) REFERENCES devices(id)
-        );
-        CREATE INDEX IF NOT EXISTS idx_refresh_user ON refresh_tokens(user_id);
-        CREATE INDEX IF NOT EXISTS idx_refresh_device ON refresh_tokens(device_id);
-        "#
-    ).execute(pool).await?;
-
+    // Use SQLx migrations from src/sql/migrations
+    sqlx::migrate!("./src/sql/migrations").run(pool).await?;
     Ok(())
 }

@@ -27,7 +27,6 @@
             sccache
             mold
             just
-            # optional helpers
             sqlx-cli
           ];
 
@@ -36,13 +35,21 @@
 
           PKG_CONFIG_PATH = pkgs.lib.makeSearchPath "lib/pkgconfig" [ pkgs.openssl.dev ];
 
-          # For sqlx (enable offline later if desired)
-          DATABASE_URL = "sqlite://./echovault.db";
+          # Defaults for local dev
+          EV_LISTEN = "0.0.0.0:8080";
+          EV_DATA_DIR = "./data";
+          EV_DATABASE_URL = "sqlite:./data/echovault.db?mode=rwc";
+          EV_JWT_SECRET = "dev-secret-change-me";
+          EV_PUBLIC_ORIGIN = "http://127.0.0.1:8080";
+          EV_JWT_TTL_SECS = "900";
+          EV_REFRESH_TTL_SECS = "2592000";
+
+          DATABASE_URL = "sqlite:./data/echovault.db?mode=rwc";
 
           shellHook = ''
             export CARGO_TERM_COLOR=always
             export RUST_LOG=''${RUST_LOG:-info}
-            echo "Dev shell: cargo in apps/server (workspace soon)"
+            mkdir -p "$EV_DATA_DIR"
           '';
         };
 

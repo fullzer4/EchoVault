@@ -3,8 +3,9 @@ use parking_lot::Mutex;
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
 use std::{collections::HashMap, sync::Arc};
+use josekit::{jwk::Jwk, jws::alg::{ecdsa::EcdsaJwsAlgorithm, eddsa::EddsaJwsAlgorithm}, jws::JwsVerifier};
 
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub struct ReplayCache {
     inner: Arc<Mutex<HashMap<String, i64>>>, // jti -> exp_ts
     window_sec: i64,
@@ -73,8 +74,11 @@ pub fn validate_dpop(
     // Split compact JWS
     let parts: Vec<&str> = dpop_header.split('.').collect();
     if parts.len() != 3 { return Err("bad_dpop"); }
-    let header_raw = b64u_decode(parts[0])?;
-    let payload_raw = b64u_decode(parts[1])?;
+    let header_b64 = parts[0];
+    let payload_b64 = parts[1];
+    let sig_b64 = parts[2];
+    let header_raw = b64u_decode(header_b64)?;
+    let payload_raw = b64u_decode(payload_b64)?;
 
     let header: DPoPHeader = serde_json::from_slice(&header_raw).map_err(|_| "bad_dpop")?;
     if header.typ.as_deref() != Some("dpop+jwt") { return Err("bad_dpop_typ"); }
@@ -103,6 +107,26 @@ pub fn validate_dpop(
     let jkt = compute_ec_thumbprint_b64u(&header.jwk)?;
     if jkt != expected_jkt { return Err("jkt_mismatch"); }
 
-    // NOTE: signature verification TODO
+    // signature verification
+    let sig = b64u_decode(sig_b64)?;
+    let signing_input = [header_b64.as_bytes(), b".", payload_b64.as_bytes()].concat();
+
+    let jwk_json = header.jwk.to_string();
+    let jwk = Jwk::from_bytes(jwk_json.as_bytes()).map_err(|_| "bad_jwk")?;
+    let verified = match header.alg.as_str() {
+        "ES256" => EcdsaJwsAlgorithm::Es256
+            .verifier_from_jwk(&jwk)
+            .ok()
+            .and_then(|v| v.verify(&signing_input, &sig).ok())
+            .is_some(),
+        "EdDSA" => EddsaJwsAlgorithm::Eddsa
+            .verifier_from_jwk(&jwk)
+            .ok()
+            .and_then(|v| v.verify(&signing_input, &sig).ok())
+            .is_some(),
+        _ => false,
+    };
+    if !verified { return Err("bad_sig"); }
+
     Ok(())
 }
